@@ -42,7 +42,9 @@ jobs:
           DTRYX_DAYS: "21"
           RUN_SECONDS: "290"
           NORMAL_INTERVAL: "7"
-          DTRYX_CONCURRENCY: "6"
+          DTRYX_CONCURRENCY: "2"
+          PAGE_TIMEOUT_MS: "12000"
+          POST_LOAD_WAIT_MS: "3500"
           DTRYX_DEBUG: "1"
         run: |
           python -u dtryx_cinecube_alert.py
