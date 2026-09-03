@@ -6,12 +6,13 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
-from playwright.async_api import async_playwright, Response, Page
+from playwright.async_api import async_playwright, Response, Page, TimeoutError as PlaywrightTimeoutError
 
 # ============================================================
 # DTRYX - 씨네큐브 특별회차 알리미 (TEST)
@@ -41,8 +42,9 @@ BASE_URL = "https://www.dtryx.com/reserve/movie.do"
 DAYS = int(os.getenv("DTRYX_DAYS", "21"))
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", "290"))
 NORMAL_INTERVAL = float(os.getenv("NORMAL_INTERVAL", "7"))
-CONCURRENCY = int(os.getenv("DTRYX_CONCURRENCY", "6"))
-PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "18000"))
+CONCURRENCY = int(os.getenv("DTRYX_CONCURRENCY", "2"))
+PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "12000"))
+POST_LOAD_WAIT_MS = int(os.getenv("POST_LOAD_WAIT_MS", "3500"))
 DEBUG = os.getenv("DTRYX_DEBUG", "1") == "1"
 
 STATE_PATH = Path(os.getenv("STATE_PATH", "state/dtryx_state.json"))
@@ -51,7 +53,7 @@ DEBUG_DIR = Path(os.getenv("DEBUG_DIR", "debug_dtryx"))
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_USER_ID = os.getenv("DISCORD_USER_ID", "").strip()
 
-KST_OFFSET = timedelta(hours=9)
+KST = ZoneInfo("Asia/Seoul")
 
 EVENT_RE = re.compile(r"-#\s*([^\n\r|,/<>]+)", re.I)
 TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
@@ -103,7 +105,7 @@ SEAT_KEYS = (
 
 
 def kst_now() -> datetime:
-    return datetime.utcnow() + KST_OFFSET
+    return datetime.now(KST)
 
 
 def log(msg: str) -> None:
@@ -466,48 +468,82 @@ def build_url(target_date: str) -> str:
     return f"{BASE_URL}?{urlencode(params)}"
 
 
-async def scan_date(browser, target_date: str, sem: asyncio.Semaphore) -> Tuple[str, List[Dict[str, str]], int]:
+async def scan_date(context, target_date: str, sem: asyncio.Semaphore) -> Tuple[str, List[Dict[str, str]], int]:
+    """
+    DTRYX는 GitHub Actions에서 DOMContentLoaded가 오래 걸릴 수 있다.
+    따라서 페이지 전체 로딩 완료를 기다리지 않고 HTTP 응답이 시작되는 commit까지만 기다린 뒤
+    XHR/fetch 응답을 수집한다. 이미지/폰트/영상은 차단해 서버·브라우저 부하를 낮춘다.
+    """
     async with sem:
-        page = await browser.new_page()
+        page = await context.new_page()
         captured: List[Tuple[str, Any]] = []
         tasks: List[asyncio.Task] = []
+        nav_started = False
+
+        async def route_handler(route):
+            try:
+                if route.request.resource_type in {"image", "font", "media"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                pass
+
+        await page.route("**/*", route_handler)
 
         def on_response(resp: Response):
-            tasks.append(asyncio.create_task(collect_json_response(resp, target_date, captured)))
+            tasks.append(asyncio.create_task(
+                collect_json_response(resp, target_date, captured)
+            ))
 
         page.on("response", on_response)
 
         try:
-            await page.goto(build_url(target_date), wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
             try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1200)
+                await page.goto(
+                    build_url(target_date),
+                    wait_until="commit",
+                    timeout=PAGE_TIMEOUT_MS,
+                )
+                nav_started = True
+            except PlaywrightTimeoutError:
+                # DTRYX는 일부 환경에서 navigation 완료 신호가 늦다.
+                # 이미 응답/XHR이 진행 중일 수 있으므로 즉시 실패시키지 않는다.
+                current = page.url or ""
+                if "dtryx.com" in current:
+                    nav_started = True
+                    if DEBUG:
+                        log(f"↻ {target_date} 페이지 로딩 지연 - 응답 수집 계속")
+                else:
+                    raise
 
+            # networkidle/domcontentloaded를 기다리지 않는다.
+            await page.wait_for_timeout(POST_LOAD_WAIT_MS)
+
+            # response 이벤트에서 만든 task가 더 생길 수 있어 한 번 더 짧게 대기
+            await page.wait_for_timeout(500)
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*list(tasks), return_exceptions=True)
 
             items: List[Dict[str, str]] = []
-            special_sources = 0
             for source_url, data in captured:
-                found_here = False
                 for d in walk_dicts(data):
                     it = parse_record(d, target_date, source_url)
                     if it:
                         items.append(it)
-                        found_here = True
-                if found_here:
-                    special_sources += 1
 
             if not items:
                 items.extend(await fallback_dom(page, target_date))
 
-            # 첫 테스트용: 특별회차가 있는데 파싱 실패하면 HTML 저장
             if DEBUG:
+                # endpoint 진단: JSON 응답을 전혀 못 잡았을 때만 짧은 로그
+                if not captured:
+                    log(f"🧪 {target_date} JSON/XHR 후보 0건 | page={page.url}")
+
+                # 특별 태그는 보이는데 파싱 실패한 경우 HTML 저장
                 try:
                     html = await page.content()
-                    if ("-#" in html or "씨네토크" in html or "#GV" in html) and not items:
+                    if ("-#" in html or "씨네토크" in html or "#GV" in html or "#무대인사" in html) and not items:
                         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
                         (DEBUG_DIR / f"{target_date}.html").write_text(html, encoding="utf-8")
                         log(f"🧪 파싱 실패 HTML 저장: {DEBUG_DIR}/{target_date}.html")
@@ -515,11 +551,18 @@ async def scan_date(browser, target_date: str, sem: asyncio.Semaphore) -> Tuple[
                     pass
 
             return target_date, dedupe_items(items), 0
+
+        except PlaywrightTimeoutError as e:
+            log(f"❌ {target_date} 접속 timeout | {PAGE_TIMEOUT_MS/1000:.0f}초")
+            return target_date, [], 1
         except Exception as e:
             log(f"❌ {target_date} 조회 오류: {type(e).__name__}: {e}")
             return target_date, [], 1
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 def process_items(items: List[Dict[str, str]], state: Dict[str, Any]) -> Tuple[int, Dict[str, int]]:
@@ -571,10 +614,10 @@ def process_items(items: List[Dict[str, str]], state: Dict[str, Any]) -> Tuple[i
     return alerts, stats
 
 
-async def full_scan(browser, dates: List[str], label: str, state: Dict[str, Any]) -> None:
+async def full_scan(context, dates: List[str], label: str, state: Dict[str, Any]) -> None:
     t0 = time.monotonic()
     sem = asyncio.Semaphore(CONCURRENCY)
-    results = await asyncio.gather(*(scan_date(browser, d, sem) for d in dates))
+    results = await asyncio.gather(*(scan_date(context, d, sem) for d in dates))
 
     all_items: List[Dict[str, str]] = []
     errors = 0
@@ -620,8 +663,20 @@ async def main() -> None:
             ],
         )
 
-        # 시작 직후 1회 전체 확인: 테스트할 때 결과를 바로 보기 위함
-        await full_scan(browser, dates, "초기 21일", state)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/152.0.0.0 Safari/537.36"
+            ),
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            viewport={"width": 1280, "height": 900},
+        )
+        context.set_default_timeout(7000)
+
+        # 시작 직후 1회 전체 확인: 최대 2개 페이지만 병렬로 열어 DTRYX 과부하를 피한다.
+        await full_scan(context, dates, "초기 21일", state)
 
         while time.monotonic() - started < RUN_SECONDS:
             now = kst_now()
@@ -630,14 +685,14 @@ async def main() -> None:
             if now.minute in (0, 30):
                 token = now.strftime("%Y-%m-%d %H:%M")
                 if token != last_halfhour_token:
-                    await full_scan(browser, dates, f"{now:%H:%M} 00/30", state)
+                    await full_scan(context, dates, f"{now:%H:%M} 00/30", state)
                     last_halfhour_token = token
 
             # 평소에는 날짜 하나씩 순차 확인
             d = dates[idx % len(dates)]
             idx += 1
             sem = asyncio.Semaphore(1)
-            _, items, err = await scan_date(browser, d, sem)
+            _, items, err = await scan_date(context, d, sem)
             cycle_err += err
             if not err:
                 cycle_ok += 1
@@ -661,6 +716,7 @@ async def main() -> None:
 
             await asyncio.sleep(NORMAL_INTERVAL)
 
+        await context.close()
         await browser.close()
 
     log("✅ 이번 GitHub Actions 감시 실행 종료")
