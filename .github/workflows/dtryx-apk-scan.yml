@@ -1,0 +1,41 @@
+name: DTRYX APK API Scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download latest DTRYX XAPK
+        run: |
+          mkdir -p download
+          curl -L --fail --retry 2 --connect-timeout 10 --max-time 90 \
+            -A "Mozilla/5.0" \
+            "https://d.apkpure.com/b/XAPK/com.dtryx.cinema?version=latest" \
+            -o download/com.dtryx.cinema.xapk
+
+          echo "Downloaded:"
+          ls -lh download/com.dtryx.cinema.xapk
+          file download/com.dtryx.cinema.xapk || true
+
+      - name: Scan APK/XAPK for API endpoints
+        run: |
+          python -u dtryx_apk_scan.py
+
+      - name: Upload scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtryx-apk-scan-report
+          path: dtryx_apk_scan_report.txt
+          if-no-files-found: error
